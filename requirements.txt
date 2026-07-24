@@ -1,0 +1,1 @@
+pyobjc-framework-WebKit>=10.0

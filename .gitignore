@@ -1,0 +1,27 @@
+# NIEMALS Daten committen - nur Quellcode + Docs gehoeren ins Repo.
+# Alles Laufzeit-/Nutzerbezogene wird ignoriert.
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Laufzeitdaten der App (Transkripte, Zusammenfassungen, Config, Logs)
+cache/
+config.json
+app.lock
+app.log
+launchd.out.log
+launchd.err.log
+ui.html
+Transcribe-out/
+
+# Medien / Modelle / Nutzerinhalte
+*.opus
+*.wav
+*.m4a
+*.bin
+*.sqlite
+*.sqlite-*
+
+# macOS
+.DS_Store
