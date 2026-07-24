@@ -1359,6 +1359,12 @@ UI_HTML = r"""<!doctype html>
   .skcirc{width:38px;height:38px;border-radius:50%;flex:none;}
   .fade{animation:fx .3s ease;} @keyframes fx{from{opacity:0;transform:translateY(3px);}to{opacity:1;}}
   svg{display:block;}
+  /* Icons pro Kontext einheitlich gross */
+  .onbicon svg{width:30px; height:30px;}
+  .featic svg{width:19px; height:19px;}
+  .ib2 svg{width:15px; height:15px;}
+  .av svg, .cav svg{width:18px; height:18px;}
+  .vic svg{width:16px; height:16px;}
   .cnt{display:flex; align-items:center; justify-content:center; height:100%;}
   .onb{z-index:20;}
   .onbwrap{flex:1; display:flex; flex-direction:column; padding:22px 24px 18px;}
@@ -1399,6 +1405,14 @@ UI_HTML = r"""<!doctype html>
   .onbstart{flex:1; height:42px; border:none; border-radius:12px; background:var(--btn);
     color:var(--btnink); font-size:14px; font-weight:600; cursor:default; box-shadow:0 3px 14px var(--ring);}
   .onbstart:active{opacity:.7;}
+  .onbstep.in-fwd{animation:onbF .3s cubic-bezier(.32,.72,0,1);}
+  .onbstep.in-bwd{animation:onbB .3s cubic-bezier(.32,.72,0,1);}
+  @keyframes onbF{from{opacity:0; transform:translateX(28px);} to{opacity:1; transform:none;}}
+  @keyframes onbB{from{opacity:0; transform:translateX(-28px);} to{opacity:1; transform:none;}}
+  .checking{font-size:12px; color:var(--sub); animation:pulse 1.2s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:.45;} 50%{opacity:1;}}
+  .okline{animation:pop .34s cubic-bezier(.3,1.5,.5,1);}
+  @keyframes pop{from{opacity:0; transform:scale(.82);} to{opacity:1; transform:scale(1);}}
 </style></head>
 <body>
 <!-- CHATS -->
@@ -1475,7 +1489,7 @@ UI_HTML = r"""<!doctype html>
       onb_copy:'Pfad kopieren', onb_copied:'Kopiert', onb_open:'Vollzugriff öffnen', onb_start:'Los geht\'s',
       onb_next:'Weiter', onb_back:'Zurück', onb_finish:'Los geht\'s',
       onb_feat_title:'Was Klartext kann', onb_perm_title:'Einmalige Berechtigung',
-      onb_check:'Zugriff prüfen', onb_granted:'Zugriff aktiv', onb_notyet:'Noch kein Zugriff',
+      onb_check:'Zugriff prüfen', onb_granted:'Zugriff aktiv', onb_notyet:'Noch kein Zugriff', onb_checking:'Warte auf Zugriff …',
       onb_ready_title:'Alles bereit', onb_ready_sub:'Klick auf das Waveform-Icon oben in der Menüleiste, wähle einen Chat und tippe auf eine Sprachnachricht.',
       feat_tx:'Transkription', feat_txd:'Sprachnachrichten zu Text, lokal mit whisper.',
       feat_sum:'Zusammenfassung', feat_sumd:'Kernaussagen auf einen Blick.',
@@ -1501,7 +1515,7 @@ UI_HTML = r"""<!doctype html>
       onb_copy:'Copy path', onb_copied:'Copied', onb_open:'Open Full Disk Access', onb_start:'Get started',
       onb_next:'Next', onb_back:'Back', onb_finish:'Get started',
       onb_feat_title:'What Klartext does', onb_perm_title:'One-time permission',
-      onb_check:'Check access', onb_granted:'Access active', onb_notyet:'No access yet',
+      onb_check:'Check access', onb_granted:'Access active', onb_notyet:'No access yet', onb_checking:'Waiting for access …',
       onb_ready_title:'All set', onb_ready_sub:'Click the waveform icon in the menu bar, pick a chat and tap a voice message.',
       feat_tx:'Transcription', feat_txd:'Voice messages to text, locally with whisper.',
       feat_sum:'Summary', feat_sumd:'Key points at a glance.',
@@ -1791,25 +1805,30 @@ UI_HTML = r"""<!doctype html>
   function toggleCfg(el,key){ const on=!el.classList.contains('on'); el.classList.toggle('on',on); setCfg(key,on); }
   function setCfg(key,val){ CFG[key]=val; post({action:'setcfg', key:key, value:val}); }
 
-  // ---------- ONBOARDING (mehrstufig, interaktiv) ----------
-  let ONB=0; const ONB_N=4;
-  const WAVES='<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h2m4-6v12M12 3v18m4-14v10m4-6v2"/></svg>';
-  window.__onboard=function(pypath){ window._pypath=pypath; ONB=0; renderOnb(); $('#s-onb').classList.add('show'); };
-  function renderOnb(){ const r=$('#onbroot'); if(r) r.innerHTML=onbStep(ONB)+onbNav(); }
+  // ---------- ONBOARDING (mehrstufig, animiert, auto-check) ----------
+  let ONB=0; const ONB_N=4; let onbPoll=null;
+  const WAVES='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h2m4-6v12M12 3v18m4-14v10m4-6v2"/></svg>';
+  window.__onboard=function(pypath){ window._pypath=pypath; ONB=0; renderOnb(1); $('#s-onb').classList.add('show'); };
+  function renderOnb(dir){
+    const r=$('#onbroot'); if(!r) return;
+    r.innerHTML=onbStep(ONB)+onbNav();
+    const st=r.querySelector('.onbstep'); if(st) st.classList.add(dir===-1?'in-bwd':'in-fwd');
+    manageOnbPoll();
+  }
   function onbStep(i){
-    if(i===0) return '<div class="onbstep fade"><div class="onbicon">'+WAVES+'</div>'
+    if(i===0) return '<div class="onbstep"><div class="onbicon">'+WAVES+'</div>'
       +'<h2>'+t('onb_title')+'</h2><p class="onbsub">'+t('onb_sub')+'</p>'
       +'<div class="langseg"><button class="'+(UILANG==='de'?'on':'')+'" onclick="onbLang(\'de\')">Deutsch</button>'
       +'<button class="'+(UILANG==='en'?'on':'')+'" onclick="onbLang(\'en\')">English</button></div></div>';
-    if(i===1) return '<div class="onbstep fade"><h2 class="onbh">'+t('onb_feat_title')+'</h2>'
+    if(i===1) return '<div class="onbstep"><h2 class="onbh">'+t('onb_feat_title')+'</h2>'
       +feat(icMic,t('feat_tx'),t('feat_txd'))+feat(icSpark,t('feat_sum'),t('feat_sumd'))
       +feat(icGlobe,t('feat_tr'),t('feat_trd'))+feat(icLock,t('feat_priv'),t('feat_privd'))+'</div>';
-    if(i===2) return '<div class="onbstep fade"><div class="onbicon lite">'+icLock+'</div><h2 class="onbh">'+t('onb_perm_title')+'</h2>'
+    if(i===2) return '<div class="onbstep"><div class="onbicon lite">'+icLock+'</div><h2 class="onbh">'+t('onb_perm_title')+'</h2>'
       +'<p class="onbsub">'+t('onb_perm')+'</p>'
       +'<div class="onbbtns"><button id="onbcopy" onclick="onbCopy()">'+t('onb_copy')+'</button>'
       +'<button onclick="post({action:\'fda\'})">'+t('onb_open')+'</button></div>'
-      +'<div class="onbstatus" id="onbstatus"><button class="chkb" onclick="post({action:\'checkaccess\'})">'+t('onb_check')+'</button></div></div>';
-    return '<div class="onbstep fade"><div class="onbicon ok">'+icCheck+'</div><h2>'+t('onb_ready_title')+'</h2><p class="onbsub">'+t('onb_ready_sub')+'</p></div>';
+      +'<div class="onbstatus" id="onbstatus"><div class="checking">'+t('onb_checking')+'</div></div></div>';
+    return '<div class="onbstep"><div class="onbicon ok">'+icCheck+'</div><h2>'+t('onb_ready_title')+'</h2><p class="onbsub">'+t('onb_ready_sub')+'</p></div>';
   }
   function feat(ic,tt,dd){ return '<div class="featrow"><span class="featic">'+ic+'</span><span class="featx"><div class="featt">'+tt+'</div><div class="featd">'+dd+'</div></span></div>'; }
   function onbNav(){
@@ -1819,12 +1838,21 @@ UI_HTML = r"""<!doctype html>
       +(ONB>0?'<button class="obk" onclick="onbGo(-1)">'+t('onb_back')+'</button>':'')
       +'<button class="onbstart" onclick="'+(last?'onbStart()':'onbGo(1)')+'">'+(last?t('onb_finish'):t('onb_next'))+'</button></div></div>';
   }
-  function onbGo(d){ ONB=Math.max(0,Math.min(ONB_N-1,ONB+d)); renderOnb(); }
-  function onbLang(l){ UILANG=l; CFG.ui_lang=l; post({action:'setcfg',key:'ui_lang',value:l}); applyLang(); post({action:'chats'}); renderOnb(); }
+  function onbGo(d){ const n=Math.max(0,Math.min(ONB_N-1,ONB+d)); if(n===ONB) return; ONB=n; renderOnb(d<0?-1:1); }
+  function onbLang(l){ UILANG=l; CFG.ui_lang=l; post({action:'setcfg',key:'ui_lang',value:l}); applyLang(); post({action:'chats'}); renderOnb(1); }
+  function manageOnbPoll(){
+    if(ONB===2){ if(!onbPoll){ post({action:'checkaccess'}); onbPoll=setInterval(()=>post({action:'checkaccess'}),1500); } }
+    else if(onbPoll){ clearInterval(onbPoll); onbPoll=null; }
+  }
   window.__access=function(status){
     const s=$('#onbstatus'); if(!s) return;
-    if(status==='ok') s.innerHTML='<div class="okline">'+icCheck+'<span>'+t('onb_granted')+'</span></div>';
-    else s.innerHTML='<button class="chkb" onclick="post({action:\'checkaccess\'})">'+t('onb_check')+'</button><span class="notyet">'+t('onb_notyet')+'</span>';
+    if(status==='ok'){
+      if(onbPoll){ clearInterval(onbPoll); onbPoll=null; }
+      s.innerHTML='<div class="okline">'+icCheck+'<span>'+t('onb_granted')+'</span></div>';
+      setTimeout(()=>{ if(ONB===2) onbGo(1); }, 950);
+    } else if(!s.querySelector('.okline')){
+      s.innerHTML='<div class="checking">'+t('onb_checking')+'</div>';
+    }
   };
   function onbCopy(){
     post({action:'copy', text: window._pypath||''});
@@ -1832,7 +1860,7 @@ UI_HTML = r"""<!doctype html>
     b.textContent=t('onb_copied'); b.classList.add('ok2');
     setTimeout(()=>{ if(b){ b.textContent=t('onb_copy'); b.classList.remove('ok2'); } },1500);
   }
-  function onbStart(){ post({action:'onboarded'}); $('#s-onb').classList.remove('show'); }
+  function onbStart(){ if(onbPoll){ clearInterval(onbPoll); onbPoll=null; } post({action:'onboarded'}); $('#s-onb').classList.remove('show'); }
 
   post({action:'chats'});
 </script>
