@@ -362,6 +362,19 @@ def time_hm(unixts):
         return ""
 
 
+def day_label(unixts):
+    try:
+        d = dt.datetime.fromtimestamp(unixts).date()
+    except (ValueError, OSError, OverflowError):
+        return ""
+    today = dt.date.today()
+    if d == today:
+        return "Heute"
+    if d == today - dt.timedelta(days=1):
+        return "Gestern"
+    return d.strftime("%d.%m.%Y")
+
+
 def media_abspath(rel):
     # DB speichert 'Media/...', Dateien liegen unter '<container>/Message/Media/...'
     if not rel:
@@ -453,6 +466,7 @@ def list_messages(chat_pk, limit=80):
                 "pk": r["pk"], "kind": kind, "me": me,
                 "text": (r["text"] or ""),
                 "time": time_hm((r["d"] or 0) + APPLE_EPOCH),
+                "day": day_label((r["d"] or 0) + APPLE_EPOCH),
                 "sender": sender, "path": path,
                 "cached": bool(path) and os.path.exists(cache_file(path)),
             })
@@ -507,6 +521,28 @@ def save_sum(path, text):
             f.write(text)
     except Exception as e:
         log(f"sum save: {e}")
+
+
+def segs_file(path):
+    base = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(CACHE, base + ".segs.json")
+
+
+def load_segs(path):
+    try:
+        with open(segs_file(path), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_segs(path, segs):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(segs_file(path), "w", encoding="utf-8") as f:
+            json.dump(segs, f)
+    except Exception as e:
+        log(f"segs save: {e}")
 
 
 def summarize(text, speaker=None, chat=None, kind=None):
@@ -582,24 +618,72 @@ def dur_label(path):
 
 
 def transcribe(path):
-    wav = os.path.join("/tmp", f"watx_{os.getpid()}_{int(time.time()*1000)}.wav")
+    """opus -> (text, segments). segments = [{'s':start_s,'e':end_s,'t':text}]."""
+    ts = int(time.time() * 1000)
+    wav = os.path.join("/tmp", f"watx_{os.getpid()}_{ts}.wav")
+    of = os.path.join("/tmp", f"watx_{os.getpid()}_{ts}")
     try:
         subprocess.run(
             [FFMPEG, "-y", "-i", path, "-ar", "16000", "-ac", "1",
              "-c:a", "pcm_s16le", wav],
             capture_output=True, check=True,
         )
-        res = subprocess.run(
-            [WHISPER, "-m", MODEL, "-l", LANG, "-nt", "-f", wav],
+        subprocess.run(
+            [WHISPER, "-m", MODEL, "-l", LANG, "-np", "-ml", "60", "-sow",
+             "-oj", "-of", of, "-f", wav],
             capture_output=True, text=True, check=True,
         )
-        lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
-        return "\n".join(lines).strip()
+        segs = []
+        try:
+            with open(of + ".json", encoding="utf-8") as f:
+                data = json.load(f)
+            for s in data.get("transcription", []):
+                t = (s.get("text") or "").strip()
+                if not t:
+                    continue
+                off = s.get("offsets") or {}
+                segs.append({"s": (off.get("from") or 0) / 1000.0,
+                             "e": (off.get("to") or 0) / 1000.0, "t": t})
+        finally:
+            try:
+                os.remove(of + ".json")
+            except OSError:
+                pass
+        text = " ".join(s["t"] for s in segs).strip()
+        return text, segs
     finally:
         try:
             os.remove(wav)
         except OSError:
             pass
+
+
+_audio_cache = {}
+
+
+def audio_datauri(path):
+    """opus -> abspielbares AAC/m4a als data-URI (fuer <audio> im WebView)."""
+    if path in _audio_cache:
+        return _audio_cache[path]
+    ts = int(time.time() * 1000)
+    m4a = os.path.join("/tmp", f"watxa_{os.getpid()}_{ts}.m4a")
+    uri = None
+    try:
+        subprocess.run(
+            [FFMPEG, "-y", "-i", path, "-c:a", "aac", "-b:a", "64k", m4a],
+            capture_output=True, check=True,
+        )
+        with open(m4a, "rb") as f:
+            uri = "data:audio/mp4;base64," + base64.b64encode(f.read()).decode()
+    except Exception as e:
+        log(f"audio: {e}")
+    finally:
+        try:
+            os.remove(m4a)
+        except OSError:
+            pass
+    _audio_cache[path] = uri
+    return uri
 
 
 def search_messages(q, limit=30):
@@ -761,6 +845,8 @@ class AppDelegate(NSObject):
             self._open_chat(int(body.get("pk")))
         elif action == "transcribe":
             self._do_transcribe(int(body.get("pk")))
+        elif action == "play":
+            self._do_play(int(body.get("pk")))
         elif action == "summary":
             self._do_summary(int(body.get("pk")))
         elif action == "translate":
@@ -840,6 +926,7 @@ class AppDelegate(NSObject):
                 if msg["kind"] == "voice" and msg["cached"] and msg["path"]:
                     item["tx"] = load_cache(msg["path"]) or ""
                     item["sum"] = load_sum(msg["path"]) or ""
+                    item["segs"] = load_segs(msg["path"]) or []
                 payload.append(item)
             self.msgmap = msgmap
             self.cur_chat = {"pk": pk, "name": name, "kind": kind, "avatar": avatar}
@@ -857,20 +944,22 @@ class AppDelegate(NSObject):
         cached = load_cache(path)
         if cached is not None:
             pbcopy(cached)
-            self._eval("window.__tx(%s, %s);" % (json.dumps(mp), json.dumps(cached)))
+            self._eval("window.__tx(%s, %s, %s);" % (
+                json.dumps(mp), json.dumps(cached), json.dumps(load_segs(path))))
             if self.cfg.get("auto_summary"):
                 self._do_summary(mp)
             return
         if self.busy:
-            self._eval("window.__tx(%s, %s);" % (
-                json.dumps(mp), json.dumps("Bitte warten - laeuft schon...")))
+            self._eval("window.__tx(%s, %s, %s);" % (
+                json.dumps(mp), json.dumps("Bitte warten - laeuft schon..."), "[]"))
             return
         self.busy = True
 
         def work():
             try:
-                text = transcribe(path)
+                text, segs = transcribe(path)
                 save_cache(path, text)
+                save_segs(path, segs)
                 stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
                 safe = "".join(c for c in (info.get("chat") or "") if c not in "/:\\")[:40]
                 try:
@@ -882,7 +971,8 @@ class AppDelegate(NSObject):
                 pbcopy(text)
                 AppHelper.callAfter(
                     self._eval,
-                    "window.__tx(%s, %s);" % (json.dumps(mp), json.dumps(text or "(leer)")))
+                    "window.__tx(%s, %s, %s);" % (
+                        json.dumps(mp), json.dumps(text or "(leer)"), json.dumps(segs)))
                 if self.cfg.get("auto_summary") and text:
                     s = summarize(text, info.get("sender"), info.get("chat"),
                                   info.get("chatkind"))
@@ -898,6 +988,20 @@ class AppDelegate(NSObject):
                     "window.__tx(%s, %s);" % (json.dumps(mp), json.dumps("Fehler bei Transkription.")))
             finally:
                 self.busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    @objc.python_method
+    def _do_play(self, mp):
+        info = self.msgmap.get(mp)
+        if not info or not info.get("path"):
+            return
+        path = info["path"]
+
+        def work():
+            uri = audio_datauri(path)
+            AppHelper.callAfter(
+                self._eval,
+                "window.__audio(%s, %s);" % (json.dumps(mp), json.dumps(uri or "")))
         threading.Thread(target=work, daemon=True).start()
 
     @objc.python_method
@@ -993,8 +1097,9 @@ class AppDelegate(NSObject):
                                 and load_cache(p) is None):
                             self._auto_done.add(p)
                             try:
-                                t = transcribe(p)
+                                t, segs = transcribe(p)
                                 save_cache(p, t)
+                                save_segs(p, segs)
                                 if self.cfg.get("auto_summary") and t:
                                     meta = resolve_meta(p)
                                     spk = (meta.get("sender")
@@ -1089,6 +1194,10 @@ UI_HTML = r"""<!doctype html>
     text-overflow:ellipsis;}
   .msgs{flex:1; overflow-y:auto; padding:10px 12px 14px; display:flex;
     flex-direction:column; gap:7px;}
+  .daysep{align-self:center; margin:6px 0 2px;}
+  .daysep span{font-size:10.5px; color:var(--sub); background:var(--glass);
+    border:1px solid var(--glassbrd); padding:3px 11px; border-radius:20px;
+    -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);}
   .m{max-width:82%; display:flex; flex-direction:column;}
   .m.me{align-self:flex-end; align-items:flex-end;}
   .sname{font-size:10.5px; color:var(--sub); margin:0 4px 2px;}
@@ -1125,6 +1234,35 @@ UI_HTML = r"""<!doctype html>
     background:transparent; color:var(--ink); font-size:11.5px; font-weight:600;
     display:inline-flex; align-items:center; gap:5px; cursor:default;}
   .chip:hover{background:var(--hover);}
+  .seg{border-radius:4px; padding:0 1px; transition:background .1s,color .1s;}
+  .seg.active{background:var(--accent); color:var(--btnink);}
+  .player{display:flex; align-items:center; gap:11px; margin:2px 0 9px;}
+  .pbtn{width:36px; height:36px; border-radius:50%; border:none; flex:none;
+    background:var(--btn); color:var(--btnink); display:flex; align-items:center;
+    justify-content:center; cursor:default; box-shadow:0 2px 12px var(--ring);}
+  .pbtn:active{transform:scale(.95);}
+  .pbtn svg{width:15px; height:15px;}
+  .wave{flex:1; display:flex; align-items:center; gap:2px; height:30px; cursor:default;}
+  .wave i{flex:1; min-width:2px; background:var(--line); border-radius:2px;
+    transition:background .12s;}
+  .wave i.on{background:var(--accent);}
+  .ptime{font-size:10.5px; color:var(--sub); min-width:30px; text-align:right;
+    font-variant-numeric:tabular-nums;}
+  .vtop{display:flex; align-items:center; gap:10px;}
+  .vsub{font-size:11px; color:var(--sub); margin:5px 2px 2px 47px;}
+  .speed{height:24px; min-width:36px; padding:0 7px; border-radius:7px;
+    border:1px solid var(--glassbrd); background:transparent; color:var(--ink);
+    font-size:11px; font-weight:700; flex:none; cursor:default;
+    font-variant-numeric:tabular-nums;}
+  .speed:hover{background:var(--hover);}
+  .ib2{width:32px; height:30px; border-radius:8px; border:1px solid var(--glassbrd);
+    background:transparent; color:var(--ink); display:inline-flex; align-items:center;
+    justify-content:center; cursor:default;}
+  .ib2:hover{background:var(--hover);}
+  .txbtn{height:32px; padding:0 14px; border-radius:9px; border:none;
+    background:var(--btn); color:var(--btnink); font-size:12px; font-weight:600;
+    display:inline-flex; align-items:center; gap:6px; cursor:default;
+    box-shadow:0 2px 10px var(--ring);}
   .card2{border:1px solid var(--glassbrd); border-radius:12px; padding:10px 12px;
     margin-top:10px; background:var(--hover); box-shadow:0 1px 6px var(--ring);}
   .c2h{font-size:10px; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
@@ -1214,6 +1352,8 @@ UI_HTML = r"""<!doctype html>
   const icSpark='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/></svg>';
   const icGlobe='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>';
   const icCopy='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+  const icPlay='<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+  const icPause='<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>';
 
   function post(o){ try{ webkit.messageHandlers.bridge.postMessage(o);}catch(e){} }
   function avHTML(av, kind){ return av ? '<img src="'+av+'">' : (kind==='group'?icUsers:icMic); }
@@ -1266,6 +1406,7 @@ UI_HTML = r"""<!doctype html>
   // ---------- CHAT HISTORY ----------
   function skMsgs(){ let h=''; const ws=['55%','40%','62%','48%','58%','44%']; for(let i=0;i<7;i++){ const me=i%2?' me':''; h+='<div class="m'+me+'"><div class="sk" style="height:32px;width:'+ws[i%ws.length]+';border-radius:14px"></div></div>'; } return h; }
   function openChat(pk){
+    stopAllAudio();
     $('#chatname').textContent=''; $('#chatav').innerHTML='';
     $('#msgs').innerHTML = skMsgs();
     $('#s-chat').classList.add('show');
@@ -1275,7 +1416,12 @@ UI_HTML = r"""<!doctype html>
     $('#chatav').innerHTML = avHTML(chat.avatar, chat.kind);
     $('#chatname').textContent = chat.name;
     const M=$('#msgs');
-    M.innerHTML = msgs.map(renderMsg).join('');
+    let html='', lastDay=null;
+    msgs.forEach(m=>{
+      if(m.day && m.day!==lastDay){ html+='<div class="daysep"><span>'+esc(m.day)+'</span></div>'; lastDay=m.day; }
+      html+=renderMsg(m);
+    });
+    M.innerHTML = html;
     $('#s-chat').classList.add('show');
     M.scrollTop = M.scrollHeight;
   };
@@ -1290,25 +1436,48 @@ UI_HTML = r"""<!doctype html>
   }
   function renderVoice(m){
     const who = m.sender || (m.me?'Du':'');
-    let body='';
-    if(m.tx){ body = voiceBody(m.pk, m.tx, m.sum); }
-    else { body = '<button class="mini" onclick="txMsg('+m.pk+')">'+icMic+'Transkribieren</button>'; }
+    let inner;
+    if(m.tx){ inner = transcriptBlock(m.pk, m.tx, m.segs) + actionsRow(m.pk, m.sum); }
+    else { inner = '<button class="txbtn" onclick="txMsg('+m.pk+')">'+icMic+'Transkribieren</button>'; }
     return '<div class="vc" data-pk="'+m.pk+'">'
-      + '<div class="vhead"><span class="vic">'+icMic+'</span>'
-      + '<span class="vmeta"><div class="vn">Sprachnachricht</div>'
-      + '<div class="vd">'+esc(who)+(who?' &middot; ':'')+esc(m.time)+'</div></span></div>'
-      + '<div class="vbody" id="vb'+m.pk+'">'+body+'</div></div>';
+      + '<div class="vtop">'+player(m.pk)+'</div>'
+      + '<div class="vsub">'+esc(who)+(who?' &middot; ':'')+esc(m.time)+'</div>'
+      + '<div class="vbody" id="vb'+m.pk+'">'+inner+'</div></div>';
   }
-  function voiceBody(pk, tx, sum){
-    let h = '<div class="txt fade">'+esc(tx)+'</div>';
-    h += '<div class="acts">'
-      + '<button class="chip" onclick="sumMsg('+pk+')">'+icSpark+'Zusammenfassen</button>'
-      + '<button class="chip" onclick="trMsg('+pk+')">'+icGlobe+'&Uuml;bersetzen</button>'
-      + '<button class="chip" onclick="cpMsg('+pk+')">'+icCopy+'Kopieren</button></div>';
-    h += '<div id="sum'+pk+'"></div><div id="tr'+pk+'"></div>';
-    if(sum) h = h.replace('<div id="sum'+pk+'"></div>', card2('sum'+pk, icSpark+'Zusammenfassung', sum));
-    window['_tx'+pk]=tx;
+  function player(pk){
+    const spd=window['_spd'+pk]||1;
+    return '<button class="pbtn" id="pb'+pk+'" onclick="playMsg('+pk+')">'+icPlay+'</button>'
+      + '<div class="wave" id="wave'+pk+'" onclick="scrub(event,'+pk+')">'+waveBars(pk)+'</div>'
+      + '<span class="ptime" id="pt'+pk+'">0:00</span>'
+      + '<button class="speed" id="sp'+pk+'" onclick="cycleSpeed('+pk+')">'+fmtSpd(spd)+'</button>';
+  }
+  function transcriptBlock(pk, tx, segs){
+    window['_tx'+pk]=tx; window['_segs'+pk]=segs||[];
+    const txt=(segs&&segs.length)
+      ? segs.map((s,i)=>'<span class="seg" data-i="'+i+'" onclick="seek('+pk+','+i+')">'+esc(s.t)+' </span>').join('')
+      : esc(tx);
+    return '<div class="txt fade" id="tx'+pk+'">'+txt+'</div>';
+  }
+  function actionsRow(pk, sum){
+    let h='<div class="acts">'
+      + '<button class="ib2" title="Zusammenfassen" onclick="sumMsg('+pk+')">'+icSpark+'</button>'
+      + '<button class="ib2" title="&Uuml;bersetzen" onclick="trMsg('+pk+')">'+icGlobe+'</button>'
+      + '<button class="ib2" title="Kopieren" onclick="cpMsg('+pk+')">'+icCopy+'</button></div>'
+      + '<div id="sum'+pk+'"></div><div id="tr'+pk+'"></div>';
+    if(sum) h=h.replace('<div id="sum'+pk+'"></div>', card2('sum'+pk, icSpark+'Zusammenfassung', sum));
     return h;
+  }
+  function waveBars(pk){
+    let seed=(pk||1)>>>0, h='';
+    for(let i=0;i<40;i++){ seed=(seed*1103515245+12345)>>>0; const v=18+(seed%78); h+='<i style="height:'+v+'%"></i>'; }
+    return h;
+  }
+  const SPEEDS=[0.5,0.75,1,1.25,1.5,1.75,2];
+  function fmtSpd(s){ return (s+'').replace('.',',')+'×'; }
+  function cycleSpeed(pk){
+    let s=window['_spd'+pk]||1; let i=SPEEDS.indexOf(s); i=(i+1)%SPEEDS.length; s=SPEEDS[i];
+    window['_spd'+pk]=s; const b=$('#sp'+pk); if(b) b.textContent=fmtSpd(s);
+    const a=window['_au'+pk]; if(a) a.playbackRate=s;
   }
   function card2(id, head, body){
     return '<div class="card2 fade" id="'+id+'"><div class="c2h">'+head+'</div><div class="c2b">'+esc(body)+'</div></div>';
@@ -1317,9 +1486,9 @@ UI_HTML = r"""<!doctype html>
     $('#vb'+pk).innerHTML = '<div class="fade">'+skLines(3)+'</div>';
     post({action:'transcribe', pk:pk});
   }
-  window.__tx = function(pk, text){
+  window.__tx = function(pk, text, segs){
     const el=$('#vb'+pk); if(!el) return;
-    el.innerHTML = voiceBody(pk, text, '');
+    el.innerHTML = transcriptBlock(pk, text, segs||[]) + actionsRow(pk, '');
   };
   function sumMsg(pk){
     let box=$('#sum'+pk); if(box) box.outerHTML='<div id="sum'+pk+'"><div class="card2"><div class="c2h">'+icSpark+'Zusammenfassung</div><div class="c2b">'+skLines(2)+'</div></div></div>';
@@ -1338,7 +1507,68 @@ UI_HTML = r"""<!doctype html>
     box.innerHTML = '<div class="card2 fade"><div class="c2h">'+icGlobe+'&Uuml;bersetzung</div><div class="c2b">'+esc(text)+'</div></div>';
   };
   function cpMsg(pk){ post({action:'copy', text: window['_tx'+pk]||''}); }
-  function closeChat(){ $('#s-chat').classList.remove('show'); }
+
+  // ---------- AUDIO + SYNC ----------
+  const AUDIOS=[];
+  function stopAllAudio(){ AUDIOS.forEach(a=>{ try{a.pause();}catch(e){} }); }
+  function playMsg(pk){
+    const a=window['_au'+pk];
+    if(a){ if(a.paused){ stopAllAudio(); a.play(); setPB(pk,true);} else { a.pause(); setPB(pk,false);} return; }
+    const b=$('#pb'+pk); if(b) b.innerHTML=icPlay+'&hellip;';
+    post({action:'play', pk:pk});
+  }
+  window.__audio=function(pk,uri){
+    if(!uri){ setPB(pk,false); return; }
+    stopAllAudio();
+    const a=new Audio(uri); window['_au'+pk]=a; AUDIOS.push(a);
+    a.playbackRate = window['_spd'+pk]||1;
+    a.addEventListener('timeupdate',()=>onTime(pk));
+    a.addEventListener('ended',()=>{ setPB(pk,false); clearSeg(pk); });
+    a.play(); setPB(pk,true);
+  };
+  function setPB(pk,on){ const b=$('#pb'+pk); if(b) b.innerHTML=(on?icPause:icPlay); }
+  function fmtT(s){ s=Math.max(0,Math.floor(s||0)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+  function onTime(pk){
+    const a=window['_au'+pk]; if(!a) return;
+    const f=a.duration? a.currentTime/a.duration : 0;
+    const w=$('#wave'+pk);
+    if(w){ const bars=w.querySelectorAll('i'); const n=Math.floor(f*bars.length);
+      bars.forEach((b,i)=>b.classList.toggle('on', i<=n)); }
+    const pt=$('#pt'+pk); if(pt) pt.textContent=fmtT(a.currentTime);
+    syncSeg(pk,a.currentTime);
+  }
+  function scrub(e,pk){
+    const a=window['_au'+pk]; const w=$('#wave'+pk); if(!w) return;
+    const r=w.getBoundingClientRect(); const f=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width));
+    if(a&&a.duration){ a.currentTime=f*a.duration; onTime(pk); } else { playMsg(pk); }
+  }
+  function syncSeg(pk,t){
+    const segs=window['_segs'+pk]||[]; const c=$('#tx'+pk); if(!c) return;
+    let idx=-1; for(let i=0;i<segs.length;i++){ if(t>=segs[i].s && t<segs[i].e){ idx=i; break; } }
+    const sp=c.querySelectorAll('.seg');
+    sp.forEach(s=>s.classList.toggle('active', +s.dataset.i===idx));
+    if(idx>=0 && sp[idx]) sp[idx].scrollIntoView({block:'nearest'});
+  }
+  function clearSeg(pk){ const c=$('#tx'+pk); if(c) c.querySelectorAll('.seg').forEach(s=>s.classList.remove('active')); }
+  function seek(pk,i){
+    const segs=window['_segs'+pk]||[]; const a=window['_au'+pk];
+    if(!a){ playMsg(pk); return; }
+    if(segs[i]){ stopAllAudio(); a.currentTime=segs[i].s; a.play(); setPB(pk,true); }
+  }
+  function closeChat(){ stopAllAudio(); $('#s-chat').classList.remove('show'); }
+
+  // ---------- Trackpad-Swipe (zwei Finger nach rechts) -> zurueck ----------
+  let swAcc=0, swTmr=null;
+  window.addEventListener('wheel', e=>{
+    if(Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+    swAcc += e.deltaX; clearTimeout(swTmr);
+    swTmr=setTimeout(()=>{swAcc=0;}, 140);
+    if(swAcc < -90){ swAcc=0; swipeBack(); }
+  }, {passive:true});
+  function swipeBack(){
+    if($('#s-set').classList.contains('show')) closeSettings();
+    else if($('#s-chat').classList.contains('show')) closeChat();
+  }
 
   // ---------- SETTINGS ----------
   const LANGS=['Englisch','Deutsch','T&uuml;rkisch','Spanisch','Franz&ouml;sisch','Italienisch','Arabisch'];
