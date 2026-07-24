@@ -14,6 +14,7 @@ import json
 import time
 import queue
 import base64
+import sys
 import fcntl
 import sqlite3
 import threading
@@ -81,6 +82,8 @@ N_RECENT = 14
 SCAN_SECONDS = 5.0
 LANG = "auto"
 
+PYPATH = os.path.realpath(sys.executable)   # echtes Binary fuer FDA-Hinweis
+
 OLLAMA_CHAT = "http://localhost:11434/api/chat"
 SUMMARY_MODEL = "qwen2.5:7b"
 SUMMARY_SYS = (
@@ -109,6 +112,8 @@ DEFAULT_CFG = {
     "n_chats": 30,
     "n_messages": 80,
     "lang": "auto",           # whisper-Sprache
+    "ui_lang": "de",          # Sprache der App-Oberflaeche (de/en)
+    "onboarded": False,       # First-Run-Onboarding gesehen
 }
 
 
@@ -362,6 +367,22 @@ def time_hm(unixts):
         return ""
 
 
+UI_LANG = "de"
+_TXT = {
+    "you": {"de": "Du", "en": "You"},
+    "today": {"de": "Heute", "en": "Today"},
+    "yesterday": {"de": "Gestern", "en": "Yesterday"},
+    "voice": {"de": "Sprachnachricht", "en": "Voice message"},
+    "image": {"de": "Bild", "en": "Image"},
+    "video": {"de": "Video", "en": "Video"},
+    "doc": {"de": "Dokument", "en": "Document"},
+}
+
+
+def tp(k):
+    return _TXT.get(k, {}).get(UI_LANG) or _TXT.get(k, {}).get("de") or k
+
+
 def day_label(unixts):
     try:
         d = dt.datetime.fromtimestamp(unixts).date()
@@ -369,9 +390,9 @@ def day_label(unixts):
         return ""
     today = dt.date.today()
     if d == today:
-        return "Heute"
+        return tp("today")
     if d == today - dt.timedelta(days=1):
-        return "Gestern"
+        return tp("yesterday")
     return d.strftime("%d.%m.%Y")
 
 
@@ -388,15 +409,17 @@ def media_abspath(rel):
     return None
 
 
-_PH_TYPE = {3: "Sprachnachricht", 1: "Bild", 2: "Video", 8: "Dokument", 4: "Bild"}
+def set_ui_lang(lang):
+    globals()["UI_LANG"] = lang if lang in ("de", "en") else "de"
 
 
 def _chat_preview(ltype, ltext, lme):
-    pre = "Du: " if lme else ""
+    pre = (tp("you") + ": ") if lme else ""
     if ltype == 0 and (ltext or "").strip():
         return (pre + resolve_mentions(ltext).replace("\n", " "))[:64]
-    ph = _PH_TYPE.get(ltype)
-    return (pre + ph) if ph else ""
+    phmap = {3: "voice", 1: "image", 2: "video", 8: "doc", 4: "image"}
+    k = phmap.get(ltype)
+    return (pre + tp(k)) if k else ""
 
 
 def list_chats(limit=30):
@@ -714,7 +737,7 @@ def search_messages(q, limit=30):
                     "cpk": r["cpk"], "name": r["name"],
                     "kind": "group" if r["st"] == 1 else "dm",
                     "snippet": (r["text"] or "").replace("\n", " ")[:80],
-                    "src": "Text",
+                    "src": "text",
                 })
         except Exception as e:
             log(f"search msg: {e}")
@@ -746,6 +769,33 @@ def search_messages(q, limit=30):
     return out[:limit]
 
 
+def search_chats(q, limit=15):
+    """Chats deren Name zur Suche passt."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+    con = _db_conn()
+    if not con:
+        return []
+    out = []
+    try:
+        rows = con.execute(
+            """SELECT Z_PK pk, ZPARTNERNAME name, ZCONTACTJID jid, ZSESSIONTYPE st
+               FROM ZWACHATSESSION
+               WHERE ZPARTNERNAME LIKE ? AND ZSESSIONTYPE IN (0,1)
+                     AND COALESCE(ZARCHIVED,0)=0 AND COALESCE(ZHIDDEN,0)=0
+                     AND COALESCE(ZREMOVED,0)=0
+               ORDER BY ZLASTMESSAGEDATE DESC LIMIT ?""",
+            ("%" + q + "%", limit)).fetchall()
+        for r in rows:
+            out.append({"cpk": r["pk"], "name": r["name"],
+                        "kind": "group" if r["st"] == 1 else "dm",
+                        "avatar": avatar_uri(r["jid"])})
+    except Exception as e:
+        log(f"search_chats: {e}")
+    return out
+
+
 def _chat_for_uuid(uuid):
     con = _db_conn()
     if not con:
@@ -772,6 +822,7 @@ class AppDelegate(NSObject):
         if self is None:
             return None
         self.cfg = load_cfg()
+        set_ui_lang(self.cfg.get("ui_lang", "de"))
         self.chats = []
         self.msgmap = {}          # msg-pk -> dict(path, sender, chat, chatkind)
         self.cur_chat = None
@@ -857,6 +908,11 @@ class AppDelegate(NSObject):
             self._send_settings()
         elif action == "setcfg":
             self._set_cfg(str(body.get("key")), body.get("value"))
+        elif action == "onboarded":
+            self.cfg["onboarded"] = True
+            save_cfg(self.cfg)
+        elif action == "checkaccess":
+            self._eval("window.__access(%s);" % json.dumps(check_access()))
         elif action == "copy":
             pbcopy(str(body.get("text", "")))
         elif action == "openfolder":
@@ -892,8 +948,12 @@ class AppDelegate(NSObject):
                 chats = []
             self.chats = chats
             acc = check_access()
-            AppHelper.callAfter(self._eval, "window.__chats(%s, %s);" % (
-                json.dumps(chats), json.dumps(acc)))
+            AppHelper.callAfter(self._eval, "window.__chats(%s, %s, %s);" % (
+                json.dumps(chats), json.dumps(acc),
+                json.dumps(self.cfg.get("ui_lang", "de"))))
+            if not self.cfg.get("onboarded"):
+                AppHelper.callAfter(
+                    self._eval, "window.__onboard(%s);" % json.dumps(PYPATH))
         threading.Thread(target=work, daemon=True).start()
 
     @objc.python_method
@@ -1066,13 +1126,15 @@ class AppDelegate(NSObject):
     def _do_search(self, q):
         def work():
             try:
-                res = search_messages(q)
+                chats = search_chats(q)
+                content = search_messages(q)
             except Exception as e:
                 log(f"search: {e}")
-                res = []
+                chats, content = [], []
             AppHelper.callAfter(
                 self._eval,
-                "window.__search(%s, %s);" % (json.dumps(q), json.dumps(res)))
+                "window.__search(%s, %s, %s);" % (
+                    json.dumps(q), json.dumps(chats), json.dumps(content)))
         threading.Thread(target=work, daemon=True).start()
 
     # ---- settings ----
@@ -1085,6 +1147,8 @@ class AppDelegate(NSObject):
         if key:
             self.cfg[key] = value
             save_cfg(self.cfg)
+            if key == "ui_lang":
+                set_ui_lang(value)
 
     # ---- auto-scanner ----
     @objc.python_method
@@ -1259,6 +1323,7 @@ UI_HTML = r"""<!doctype html>
     background:transparent; color:var(--ink); display:inline-flex; align-items:center;
     justify-content:center; cursor:default;}
   .ib2:hover{background:var(--hover);}
+  .ib2.ok{background:var(--btn); color:var(--btnink); border-color:transparent;}
   .txbtn{height:32px; padding:0 14px; border-radius:9px; border:none;
     background:var(--btn); color:var(--btnink); font-size:12px; font-weight:600;
     display:inline-flex; align-items:center; gap:6px; cursor:default;
@@ -1295,6 +1360,45 @@ UI_HTML = r"""<!doctype html>
   .fade{animation:fx .3s ease;} @keyframes fx{from{opacity:0;transform:translateY(3px);}to{opacity:1;}}
   svg{display:block;}
   .cnt{display:flex; align-items:center; justify-content:center; height:100%;}
+  .onb{z-index:20;}
+  .onbwrap{flex:1; display:flex; flex-direction:column; padding:22px 24px 18px;}
+  .onbstep{flex:1; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; text-align:center; gap:11px;}
+  .onbicon{width:70px; height:70px; border-radius:22px; background:var(--btn);
+    color:var(--btnink); display:flex; align-items:center; justify-content:center;
+    box-shadow:var(--elev);}
+  .onbicon.lite{background:var(--hover); color:var(--ink); box-shadow:none;}
+  .onbstep h2{margin:6px 0 0; font-size:20px; font-weight:700; letter-spacing:-.01em;}
+  .onbsub{margin:0; font-size:13px; line-height:1.5; color:var(--sub); max-width:300px;}
+  .langseg{display:flex; gap:8px; margin-top:8px;}
+  .langseg button{height:36px; padding:0 18px; border-radius:10px; border:1px solid var(--glassbrd);
+    background:transparent; color:var(--ink); font-size:13px; font-weight:600; cursor:default;}
+  .langseg button.on{background:var(--btn); color:var(--btnink); border-color:transparent;}
+  .featrow{display:flex; align-items:center; gap:13px; width:100%; text-align:left; padding:8px 2px;}
+  .featic{width:40px; height:40px; border-radius:11px; flex:none; background:var(--hover);
+    color:var(--ink); display:flex; align-items:center; justify-content:center;}
+  .featt{font-size:14px; font-weight:600;}
+  .featd{font-size:12px; color:var(--sub); margin-top:1px;}
+  .onbbtns{display:flex; gap:8px; width:100%; margin-top:2px;}
+  .onbbtns button{flex:1; height:36px; border:1px solid var(--glassbrd); border-radius:10px;
+    background:transparent; color:var(--ink); font-size:12px; font-weight:600; cursor:default;}
+  .onbbtns button:hover{background:var(--hover);}
+  .onbbtns button.ok2{background:var(--btn); color:var(--btnink); border-color:transparent;}
+  .onbstatus{margin-top:12px; display:flex; align-items:center; gap:10px; justify-content:center;}
+  .chkb{height:32px; padding:0 14px; border-radius:9px; border:1px solid var(--glassbrd);
+    background:transparent; color:var(--ink); font-size:12px; font-weight:600; cursor:default;}
+  .okline{display:flex; align-items:center; gap:7px; color:var(--ink); font-size:13px; font-weight:600;}
+  .notyet{font-size:11.5px; color:var(--sub);}
+  .onbnav{margin-top:14px; display:flex; flex-direction:column; gap:12px; align-items:center;}
+  .dots{display:flex; gap:6px;}
+  .dot{width:6px; height:6px; border-radius:50%; background:var(--line); transition:width .2s,background .2s;}
+  .dot.on{background:var(--btn); width:18px; border-radius:3px;}
+  .navb{display:flex; gap:8px; width:100%;}
+  .obk{height:42px; padding:0 18px; border-radius:12px; border:1px solid var(--glassbrd);
+    background:transparent; color:var(--ink); font-size:14px; font-weight:600; cursor:default; flex:none;}
+  .onbstart{flex:1; height:42px; border:none; border-radius:12px; background:var(--btn);
+    color:var(--btnink); font-size:14px; font-weight:600; cursor:default; box-shadow:0 3px 14px var(--ring);}
+  .onbstart:active{opacity:.7;}
 </style></head>
 <body>
 <!-- CHATS -->
@@ -1335,17 +1439,80 @@ UI_HTML = r"""<!doctype html>
     <span class="back" onclick="closeSettings()">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
     </span>
-    <span class="cname">Einstellungen</span>
+    <span class="cname" data-i18n="settings">Einstellungen</span>
   </div>
   <div class="hair"></div>
   <div class="sect" id="setbody"></div>
-  <div class="foot">Lokal &amp; privat &middot; whisper large-v3-turbo + qwen2.5</div>
+  <div class="foot" id="foot">Lokal &amp; privat &middot; whisper large-v3-turbo + qwen2.5</div>
 </div>
+
+<!-- ONBOARDING (mehrstufig, per JS gerendert) -->
+<div class="screen over onb" id="s-onb"><div class="onbwrap" id="onbroot"></div></div>
 
 <script>
   const $ = s => document.querySelector(s);
   const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  let CHATS=[], ACCESS='ok', CFG={}, searchTimer=null;
+  let CHATS=[], ACCESS='ok', CFG={}, searchTimer=null, UILANG='de';
+
+  const I18N={
+    de:{ search_ph:'Suchen in Chats und Transkripten...', settings:'Einstellungen',
+      back:'Zurück', transcribe:'Transkribieren', summarize:'Zusammenfassen',
+      translate:'Übersetzen', copy:'Kopieren', summary:'Zusammenfassung',
+      translation:'Übersetzung', chats:'Chats', inmsgs:'In Nachrichten & Transkripten',
+      nores:'Nichts gefunden für', novoice:'Keine Sprachnachrichten gefunden. Sobald WhatsApp welche empfängt, erscheinen sie hier.',
+      wanf:'WhatsApp-Mac nicht gefunden.', fdatitle:'Zugriff nötig',
+      fdatext:'Aktiviere „Vollzugriff auf Festplatte“ für Klartext.', fdabtn:'Einstellungen öffnen',
+      auto:'Auto-Transkription', autoh:'Neue Sprachnachrichten automatisch transkribieren',
+      autosum:'Auto-Zusammenfassung', autosumh:'Nach dem Transkribieren automatisch zusammenfassen',
+      transto:'Übersetzen nach', transtoh:'Zielsprache für den Übersetzen-Button',
+      uilang:'Sprache', uilangh:'Sprache der App', openfolder:'Transkript-Ordner öffnen',
+      quit:'Klartext beenden', foot:'Lokal & privat · whisper large-v3-turbo + qwen2.5',
+      image:'Bild', video:'Video', doc:'Dokument', media:'Medien',
+      s_text:'Text', s_voice:'Sprachnachricht', you:'Du',
+      onb_title:'Willkommen bei Klartext',
+      onb_sub:'WhatsApp-Sprachnachrichten lokal transkribieren und zusammenfassen. Alles bleibt auf deinem Mac.',
+      onb_perm:'Einmal „Vollzugriff auf Festplatte“ erlauben, damit Klartext WhatsApp lesen darf. Pfad kopieren und in den Systemeinstellungen hinzufügen.',
+      onb_copy:'Pfad kopieren', onb_copied:'Kopiert', onb_open:'Vollzugriff öffnen', onb_start:'Los geht\'s',
+      onb_next:'Weiter', onb_back:'Zurück', onb_finish:'Los geht\'s',
+      onb_feat_title:'Was Klartext kann', onb_perm_title:'Einmalige Berechtigung',
+      onb_check:'Zugriff prüfen', onb_granted:'Zugriff aktiv', onb_notyet:'Noch kein Zugriff',
+      onb_ready_title:'Alles bereit', onb_ready_sub:'Klick auf das Waveform-Icon oben in der Menüleiste, wähle einen Chat und tippe auf eine Sprachnachricht.',
+      feat_tx:'Transkription', feat_txd:'Sprachnachrichten zu Text, lokal mit whisper.',
+      feat_sum:'Zusammenfassung', feat_sumd:'Kernaussagen auf einen Blick.',
+      feat_tr:'Übersetzung', feat_trd:'In jede Sprache, lokal.',
+      feat_priv:'100% privat', feat_privd:'Nichts verlässt deinen Mac.' },
+    en:{ search_ph:'Search chats and transcripts...', settings:'Settings',
+      back:'Back', transcribe:'Transcribe', summarize:'Summarize',
+      translate:'Translate', copy:'Copy', summary:'Summary',
+      translation:'Translation', chats:'Chats', inmsgs:'In messages & transcripts',
+      nores:'Nothing found for', novoice:'No voice messages found yet. They appear here as WhatsApp receives them.',
+      wanf:'WhatsApp for Mac not found.', fdatitle:'Access needed',
+      fdatext:'Enable Full Disk Access for Klartext.', fdabtn:'Open Settings',
+      auto:'Auto-transcription', autoh:'Automatically transcribe new voice messages',
+      autosum:'Auto-summary', autosumh:'Summarize automatically after transcribing',
+      transto:'Translate into', transtoh:'Target language for the Translate button',
+      uilang:'Language', uilangh:'App language', openfolder:'Open transcript folder',
+      quit:'Quit Klartext', foot:'Local & private · whisper large-v3-turbo + qwen2.5',
+      image:'Image', video:'Video', doc:'Document', media:'Media',
+      s_text:'Text', s_voice:'Voice message', you:'You',
+      onb_title:'Welcome to Klartext',
+      onb_sub:'Transcribe and summarize WhatsApp voice messages locally. Everything stays on your Mac.',
+      onb_perm:'Grant Full Disk Access once so Klartext can read WhatsApp. Copy the path and add it in System Settings.',
+      onb_copy:'Copy path', onb_copied:'Copied', onb_open:'Open Full Disk Access', onb_start:'Get started',
+      onb_next:'Next', onb_back:'Back', onb_finish:'Get started',
+      onb_feat_title:'What Klartext does', onb_perm_title:'One-time permission',
+      onb_check:'Check access', onb_granted:'Access active', onb_notyet:'No access yet',
+      onb_ready_title:'All set', onb_ready_sub:'Click the waveform icon in the menu bar, pick a chat and tap a voice message.',
+      feat_tx:'Transcription', feat_txd:'Voice messages to text, locally with whisper.',
+      feat_sum:'Summary', feat_sumd:'Key points at a glance.',
+      feat_tr:'Translation', feat_trd:'Into any language, locally.',
+      feat_priv:'100% private', feat_privd:'Nothing leaves your Mac.' } };
+  function t(k){ return (I18N[UILANG]&&I18N[UILANG][k]) || I18N.de[k] || k; }
+  function applyLang(){
+    document.querySelectorAll('[data-i18n]').forEach(el=>{ el.textContent=t(el.dataset.i18n); });
+    const q=$('#q'); if(q) q.placeholder=t('search_ph');
+    const ft=$('#foot'); if(ft) ft.textContent=t('foot');
+  }
 
   const icMic='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg>';
   const icUsers='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13A4 4 0 0 1 16 11"/></svg>';
@@ -1354,6 +1521,8 @@ UI_HTML = r"""<!doctype html>
   const icCopy='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
   const icPlay='<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
   const icPause='<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>';
+  const icCheck='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  const icLock='<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 
   function post(o){ try{ webkit.messageHandlers.bridge.postMessage(o);}catch(e){} }
   function avHTML(av, kind){ return av ? '<img src="'+av+'">' : (kind==='group'?icUsers:icMic); }
@@ -1361,11 +1530,11 @@ UI_HTML = r"""<!doctype html>
   function skRows(n){ let h=''; for(let i=0;i<(n||7);i++) h+='<div class="skrow"><div class="sk skcirc"></div><div style="flex:1"><div class="sk skln" style="width:'+(46+i%3*13)+'%"></div><div class="sk skln" style="width:'+(70-i%4*10)+'%"></div></div></div>'; return h; }
 
   // ---------- CHATS ----------
-  window.__chats = function(chats, access){
-    CHATS=chats; ACCESS=access;
+  window.__chats = function(chats, access, lang){
+    CHATS=chats; ACCESS=access; if(lang){ UILANG=lang; } applyLang();
     const L=$('#chatlist');
     if(access==='denied'){ L.innerHTML=emptyFDA(); return; }
-    if(access==='missing'){ L.innerHTML='<div class="empty">'+icMic+'<p>WhatsApp-Mac nicht gefunden.</p></div>'; return; }
+    if(access==='missing'){ L.innerHTML='<div class="empty">'+icMic+'<p>'+t('wanf')+'</p></div>'; return; }
     if(!chats.length){ L.innerHTML=skRows(7); return; }
     renderChats(chats);
   };
@@ -1380,8 +1549,8 @@ UI_HTML = r"""<!doctype html>
   }
   function emptyFDA(){
     return '<div class="empty"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>'
-      + '<p><b>Zugriff n&ouml;tig</b><br>Aktiviere &bdquo;Vollzugriff auf Festplatte&ldquo; f&uuml;r Klartext.</p>'
-      + '<button class="mini" onclick="post({action:\'fda\'})">Einstellungen &ouml;ffnen</button></div>';
+      + '<p><b>'+t('fdatitle')+'</b><br>'+t('fdatext')+'</p>'
+      + '<button class="mini" onclick="post({action:\'fda\'})">'+t('fdabtn')+'</button></div>';
   }
 
   // ---------- SEARCH ----------
@@ -1390,17 +1559,29 @@ UI_HTML = r"""<!doctype html>
     if(!v.trim()){ renderChats(CHATS); return; }
     searchTimer=setTimeout(()=>post({action:'search', q:v}), 250);
   }
-  window.__search = function(q, res){
+  window.__search = function(q, chats, content){
     if($('#q').value.trim()!==q.trim()) return;
     const L=$('#chatlist');
-    if(!res.length){ L.innerHTML='<div class="empty"><p>Nichts gefunden f&uuml;r &bdquo;'+esc(q)+'&ldquo;.</p></div>'; return; }
-    L.innerHTML = res.map(r =>
-      '<div class="row" onclick="openChat('+r.cpk+')">'
-      + '<span class="av">'+(r.kind==='group'?icUsers:icMic)+'</span>'
-      + '<span class="meta"><div class="t">'+esc(r.name)+'</div>'
-      + '<div class="d">'+esc(r.snippet)+'</div></span>'
-      + '<span class="rt">'+esc(r.src)+'</span></div>'
-    ).join('');
+    if(!chats.length && !content.length){
+      L.innerHTML='<div class="empty"><p>'+t('nores')+' &bdquo;'+esc(q)+'&ldquo;.</p></div>'; return;
+    }
+    let h='';
+    if(chats.length){
+      h+='<div class="grp">'+t('chats')+'</div>';
+      h+=chats.map(c=>'<div class="row" onclick="openChat('+c.cpk+')">'
+        +'<span class="av">'+avHTML(c.avatar,c.kind)+'</span>'
+        +'<span class="meta"><div class="t">'+esc(c.name)+'</div></span>'
+        +'<svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></div>').join('');
+    }
+    if(content.length){
+      h+='<div class="grp">'+t('inmsgs')+'</div>';
+      h+=content.map(r=>'<div class="row" onclick="openChat('+r.cpk+')">'
+        +'<span class="av">'+(r.kind==='group'?icUsers:icMic)+'</span>'
+        +'<span class="meta"><div class="t">'+esc(r.name)+'</div>'
+        +'<div class="d">'+esc(r.snippet)+'</div></span>'
+        +'<span class="rt">'+t('s_'+r.src)+'</span></div>').join('');
+    }
+    L.innerHTML=h;
   };
 
   // ---------- CHAT HISTORY ----------
@@ -1431,14 +1612,14 @@ UI_HTML = r"""<!doctype html>
     const sname = (!m.me && m.sender) ? '<div class="sname">'+esc(m.sender)+'</div>' : '';
     let inner;
     if(m.kind==='text') inner = esc(m.text);
-    else inner = '<span class="ph">['+({image:'Bild',video:'Video',doc:'Dokument'}[m.kind]||'Medien')+']</span>';
+    else inner = '<span class="ph">['+t({image:'image',video:'video',doc:'doc'}[m.kind]||'media')+']</span>';
     return '<div class="m'+me+'">'+sname+'<div class="bub">'+inner+'</div><div class="bt">'+esc(m.time)+'</div></div>';
   }
   function renderVoice(m){
     const who = m.sender || (m.me?'Du':'');
     let inner;
     if(m.tx){ inner = transcriptBlock(m.pk, m.tx, m.segs) + actionsRow(m.pk, m.sum); }
-    else { inner = '<button class="txbtn" onclick="txMsg('+m.pk+')">'+icMic+'Transkribieren</button>'; }
+    else { inner = '<button class="txbtn" onclick="txMsg('+m.pk+')">'+icMic+t('transcribe')+'</button>'; }
     return '<div class="vc" data-pk="'+m.pk+'">'
       + '<div class="vtop">'+player(m.pk)+'</div>'
       + '<div class="vsub">'+esc(who)+(who?' &middot; ':'')+esc(m.time)+'</div>'
@@ -1460,11 +1641,11 @@ UI_HTML = r"""<!doctype html>
   }
   function actionsRow(pk, sum){
     let h='<div class="acts">'
-      + '<button class="ib2" title="Zusammenfassen" onclick="sumMsg('+pk+')">'+icSpark+'</button>'
-      + '<button class="ib2" title="&Uuml;bersetzen" onclick="trMsg('+pk+')">'+icGlobe+'</button>'
-      + '<button class="ib2" title="Kopieren" onclick="cpMsg('+pk+')">'+icCopy+'</button></div>'
+      + '<button class="ib2" title="'+t('summarize')+'" onclick="sumMsg('+pk+')">'+icSpark+'</button>'
+      + '<button class="ib2" title="'+t('translate')+'" onclick="trMsg('+pk+')">'+icGlobe+'</button>'
+      + '<button class="ib2" id="cp'+pk+'" title="'+t('copy')+'" onclick="cpMsg('+pk+')">'+icCopy+'</button></div>'
       + '<div id="sum'+pk+'"></div><div id="tr'+pk+'"></div>';
-    if(sum) h=h.replace('<div id="sum'+pk+'"></div>', card2('sum'+pk, icSpark+'Zusammenfassung', sum));
+    if(sum) h=h.replace('<div id="sum'+pk+'"></div>', card2('sum'+pk, icSpark+t('summary'), sum));
     return h;
   }
   function waveBars(pk){
@@ -1491,22 +1672,27 @@ UI_HTML = r"""<!doctype html>
     el.innerHTML = transcriptBlock(pk, text, segs||[]) + actionsRow(pk, '');
   };
   function sumMsg(pk){
-    let box=$('#sum'+pk); if(box) box.outerHTML='<div id="sum'+pk+'"><div class="card2"><div class="c2h">'+icSpark+'Zusammenfassung</div><div class="c2b">'+skLines(2)+'</div></div></div>';
+    let box=$('#sum'+pk); if(box) box.outerHTML='<div id="sum'+pk+'"><div class="card2"><div class="c2h">'+icSpark+t('summary')+'</div><div class="c2b">'+skLines(2)+'</div></div></div>';
     post({action:'summary', pk:pk});
   }
   window.__sum = function(pk, text){
     const box=$('#sum'+pk); if(!box) return;
-    box.innerHTML = '<div class="card2 fade"><div class="c2h">'+icSpark+'Zusammenfassung</div><div class="c2b">'+esc(text)+'</div></div>';
+    box.innerHTML = '<div class="card2 fade"><div class="c2h">'+icSpark+t('summary')+'</div><div class="c2b">'+esc(text)+'</div></div>';
   };
   function trMsg(pk){
-    let box=$('#tr'+pk); if(box) box.innerHTML='<div class="card2"><div class="c2h">'+icGlobe+'&Uuml;bersetzung</div><div class="c2b">'+skLines(2)+'</div></div>';
+    let box=$('#tr'+pk); if(box) box.innerHTML='<div class="card2"><div class="c2h">'+icGlobe+t('translation')+'</div><div class="c2b">'+skLines(2)+'</div></div>';
     post({action:'translate', pk:pk});
   }
   window.__tr = function(pk, text){
     const box=$('#tr'+pk); if(!box) return;
-    box.innerHTML = '<div class="card2 fade"><div class="c2h">'+icGlobe+'&Uuml;bersetzung</div><div class="c2b">'+esc(text)+'</div></div>';
+    box.innerHTML = '<div class="card2 fade"><div class="c2h">'+icGlobe+t('translation')+'</div><div class="c2b">'+esc(text)+'</div></div>';
   };
-  function cpMsg(pk){ post({action:'copy', text: window['_tx'+pk]||''}); }
+  function cpMsg(pk){
+    post({action:'copy', text: window['_tx'+pk]||''});
+    const b=$('#cp'+pk); if(!b) return;
+    b.innerHTML=icCheck; b.classList.add('ok');
+    setTimeout(()=>{ if(b){ b.innerHTML=icCopy; b.classList.remove('ok'); } }, 1400);
+  }
 
   // ---------- AUDIO + SYNC ----------
   const AUDIOS=[];
@@ -1557,40 +1743,96 @@ UI_HTML = r"""<!doctype html>
   }
   function closeChat(){ stopAllAudio(); $('#s-chat').classList.remove('show'); }
 
-  // ---------- Trackpad-Swipe (zwei Finger nach rechts) -> zurueck ----------
-  let swAcc=0, swTmr=null;
+  // ---------- Interaktiver Trackpad-Swipe (folgt dem Finger) -> zurueck ----------
+  let sw={active:false, el:null, w:0, dx:0, tmr:null};
   window.addEventListener('wheel', e=>{
-    if(Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
-    swAcc += e.deltaX; clearTimeout(swTmr);
-    swTmr=setTimeout(()=>{swAcc=0;}, 140);
-    if(swAcc < -90){ swAcc=0; swipeBack(); }
+    if(Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;         // nur horizontal
+    const el = $('#s-set').classList.contains('show') ? $('#s-set')
+             : ($('#s-chat').classList.contains('show') ? $('#s-chat') : null);
+    if(!el) return;
+    if(!sw.active || sw.el!==el){ sw.active=true; sw.el=el; sw.w=el.offsetWidth||360; sw.dx=0; el.style.transition='none'; }
+    sw.dx = Math.max(0, Math.min(sw.w, sw.dx - e.deltaX));       // Wisch rechts (deltaX<0) -> dx groesser
+    sw.el.style.transform = 'translateX('+sw.dx+'px)';
+    sw.el.style.opacity = String(1 - (sw.dx/sw.w)*0.25);
+    clearTimeout(sw.tmr); sw.tmr=setTimeout(endSwipe, 90);
   }, {passive:true});
-  function swipeBack(){
-    if($('#s-set').classList.contains('show')) closeSettings();
-    else if($('#s-chat').classList.contains('show')) closeChat();
+  function endSwipe(){
+    if(!sw.active) return;
+    const el=sw.el, done = sw.dx > sw.w*0.32;
+    el.style.transition=''; el.style.transform=''; el.style.opacity='';
+    if(done){ el.classList.remove('show'); if(el.id==='s-chat') stopAllAudio(); }
+    sw.active=false; sw.el=null; sw.dx=0;
   }
 
   // ---------- SETTINGS ----------
-  const LANGS=['Englisch','Deutsch','T&uuml;rkisch','Spanisch','Franz&ouml;sisch','Italienisch','Arabisch'];
   function openSettings(){ post({action:'settings'}); $('#s-set').classList.add('show'); }
   function closeSettings(){ $('#s-set').classList.remove('show'); }
   window.__settings = function(cfg){
-    CFG=cfg;
-    const opts=LANGS.map(l=>'<option'+(cfg.translate_to===l.replace(/&[a-z]+;/g,m=>({'&uuml;':'ü','&ouml;':'ö'}[m]||m))?' selected':'')+'>'+l+'</option>').join('');
+    CFG=cfg; UILANG=cfg.ui_lang||'de'; applyLang();
+    const LANGS=['Englisch','Deutsch','Türkisch','Spanisch','Französisch','Italienisch','Arabisch'];
+    const opts=LANGS.map(l=>'<option'+(cfg.translate_to===l?' selected':'')+'>'+l+'</option>').join('');
+    const langOpts=[['de','Deutsch'],['en','English']].map(x=>'<option value="'+x[0]+'"'+(UILANG===x[0]?' selected':'')+'>'+x[1]+'</option>').join('');
     $('#setbody').innerHTML =
-      swRow('auto','Auto-Transkription','Neue Sprachnachrichten automatisch transkribieren', cfg.auto)
-      + swRow('auto_summary','Auto-Zusammenfassung','Nach dem Transkribieren automatisch zusammenfassen', cfg.auto_summary)
-      + '<div class="srow"><div class="lab"><div class="n">&Uuml;bersetzen nach</div><div class="h">Zielsprache f&uuml;r den &Uuml;bersetzen-Button</div></div>'
-      + '<select onchange="setCfg(\'translate_to\', this.value)">'+opts+'</select></div>'
-      + '<div class="srow link" onclick="post({action:\'openfolder\'})"><div class="lab"><div class="n">Transkript-Ordner &ouml;ffnen</div></div></div>'
-      + '<div class="srow link" onclick="post({action:\'quit\'})"><div class="lab"><div class="n">Klartext beenden</div></div></div>';
+      swRow('auto',t('auto'),t('autoh'),cfg.auto)
+      + swRow('auto_summary',t('autosum'),t('autosumh'),cfg.auto_summary)
+      + selRow(t('uilang'),t('uilangh'),'ui_lang',langOpts,true)
+      + selRow(t('transto'),t('transtoh'),'translate_to',opts,false)
+      + '<div class="srow link" onclick="post({action:\'openfolder\'})"><div class="lab"><div class="n">'+t('openfolder')+'</div></div></div>';
   };
+  function selRow(name,hint,key,opts,isLang){
+    return '<div class="srow"><div class="lab"><div class="n">'+name+'</div><div class="h">'+hint+'</div></div>'
+      + '<select onchange="setCfg(\''+key+'\',this.value);'+(isLang?'reloadLang(this.value);':'')+'">'+opts+'</select></div>';
+  }
+  function reloadLang(l){ UILANG=l; CFG.ui_lang=l; applyLang(); window.__settings(CFG); post({action:'chats'}); }
   function swRow(key,name,hint,on){
     return '<div class="srow"><div class="lab"><div class="n">'+name+'</div><div class="h">'+hint+'</div></div>'
       + '<span class="sw'+(on?' on':'')+'" onclick="toggleCfg(this,\''+key+'\')"></span></div>';
   }
   function toggleCfg(el,key){ const on=!el.classList.contains('on'); el.classList.toggle('on',on); setCfg(key,on); }
   function setCfg(key,val){ CFG[key]=val; post({action:'setcfg', key:key, value:val}); }
+
+  // ---------- ONBOARDING (mehrstufig, interaktiv) ----------
+  let ONB=0; const ONB_N=4;
+  const WAVES='<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12h2m4-6v12M12 3v18m4-14v10m4-6v2"/></svg>';
+  window.__onboard=function(pypath){ window._pypath=pypath; ONB=0; renderOnb(); $('#s-onb').classList.add('show'); };
+  function renderOnb(){ const r=$('#onbroot'); if(r) r.innerHTML=onbStep(ONB)+onbNav(); }
+  function onbStep(i){
+    if(i===0) return '<div class="onbstep fade"><div class="onbicon">'+WAVES+'</div>'
+      +'<h2>'+t('onb_title')+'</h2><p class="onbsub">'+t('onb_sub')+'</p>'
+      +'<div class="langseg"><button class="'+(UILANG==='de'?'on':'')+'" onclick="onbLang(\'de\')">Deutsch</button>'
+      +'<button class="'+(UILANG==='en'?'on':'')+'" onclick="onbLang(\'en\')">English</button></div></div>';
+    if(i===1) return '<div class="onbstep fade"><h2 class="onbh">'+t('onb_feat_title')+'</h2>'
+      +feat(icMic,t('feat_tx'),t('feat_txd'))+feat(icSpark,t('feat_sum'),t('feat_sumd'))
+      +feat(icGlobe,t('feat_tr'),t('feat_trd'))+feat(icLock,t('feat_priv'),t('feat_privd'))+'</div>';
+    if(i===2) return '<div class="onbstep fade"><div class="onbicon lite">'+icLock+'</div><h2 class="onbh">'+t('onb_perm_title')+'</h2>'
+      +'<p class="onbsub">'+t('onb_perm')+'</p>'
+      +'<div class="onbbtns"><button id="onbcopy" onclick="onbCopy()">'+t('onb_copy')+'</button>'
+      +'<button onclick="post({action:\'fda\'})">'+t('onb_open')+'</button></div>'
+      +'<div class="onbstatus" id="onbstatus"><button class="chkb" onclick="post({action:\'checkaccess\'})">'+t('onb_check')+'</button></div></div>';
+    return '<div class="onbstep fade"><div class="onbicon ok">'+icCheck+'</div><h2>'+t('onb_ready_title')+'</h2><p class="onbsub">'+t('onb_ready_sub')+'</p></div>';
+  }
+  function feat(ic,tt,dd){ return '<div class="featrow"><span class="featic">'+ic+'</span><span class="featx"><div class="featt">'+tt+'</div><div class="featd">'+dd+'</div></span></div>'; }
+  function onbNav(){
+    let dots=''; for(let i=0;i<ONB_N;i++) dots+='<span class="dot'+(i===ONB?' on':'')+'"></span>';
+    const last=ONB===ONB_N-1;
+    return '<div class="onbnav"><div class="dots">'+dots+'</div><div class="navb">'
+      +(ONB>0?'<button class="obk" onclick="onbGo(-1)">'+t('onb_back')+'</button>':'')
+      +'<button class="onbstart" onclick="'+(last?'onbStart()':'onbGo(1)')+'">'+(last?t('onb_finish'):t('onb_next'))+'</button></div></div>';
+  }
+  function onbGo(d){ ONB=Math.max(0,Math.min(ONB_N-1,ONB+d)); renderOnb(); }
+  function onbLang(l){ UILANG=l; CFG.ui_lang=l; post({action:'setcfg',key:'ui_lang',value:l}); applyLang(); post({action:'chats'}); renderOnb(); }
+  window.__access=function(status){
+    const s=$('#onbstatus'); if(!s) return;
+    if(status==='ok') s.innerHTML='<div class="okline">'+icCheck+'<span>'+t('onb_granted')+'</span></div>';
+    else s.innerHTML='<button class="chkb" onclick="post({action:\'checkaccess\'})">'+t('onb_check')+'</button><span class="notyet">'+t('onb_notyet')+'</span>';
+  };
+  function onbCopy(){
+    post({action:'copy', text: window._pypath||''});
+    const b=$('#onbcopy'); if(!b) return;
+    b.textContent=t('onb_copied'); b.classList.add('ok2');
+    setTimeout(()=>{ if(b){ b.textContent=t('onb_copy'); b.classList.remove('ok2'); } },1500);
+  }
+  function onbStart(){ post({action:'onboarded'}); $('#s-onb').classList.remove('show'); }
 
   post({action:'chats'});
 </script>
